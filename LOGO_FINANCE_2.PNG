@@ -1,0 +1,499 @@
+from __future__ import annotations
+
+import io
+import json
+import re
+import shutil
+import sqlite3
+from datetime import date, datetime
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
+import streamlit as st
+from docx import Document
+
+try:
+    import pdfplumber
+except Exception:
+    pdfplumber = None
+
+try:
+    from pypdf import PdfReader
+except Exception:
+    PdfReader = None
+
+APP_NAME = "FinancePlus Mandato"
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "FinancePlus_Data"
+UPLOAD_DIR = DATA_DIR / "uploads"
+MANDATI_DIR = DATA_DIR / "mandati"
+DB_PATH = DATA_DIR / "financeplus_mandato.db"
+TEMPLATE_PATH = BASE_DIR / "Mandato_vuoto.docx"
+LOGO_PATH = BASE_DIR / "LOGO_FINANCE_2.PNG"
+
+for folder in (DATA_DIR, UPLOAD_DIR, MANDATI_DIR):
+    folder.mkdir(parents=True, exist_ok=True)
+
+CLIENT_FIELDS = [
+    "denominazione", "partita_iva", "codice_fiscale", "sede_legale", "sede_operativa",
+    "anno_costituzione", "settore_attivita", "codice_ateco", "mail_azienda",
+    "telefono_azienda", "pec", "amministratore_nome", "amministratore_carica",
+    "amministratore_luogo_nascita", "amministratore_data_nascita",
+    "amministratore_residenza", "amministratore_codice_fiscale",
+    "amministratore_dati_completi", "report_path",
+]
+
+
+def now_iso() -> str:
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def clean(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip(" ;,.-")
+
+
+def safe_filename(value: str, fallback: str = "file") -> str:
+    value = re.sub(r"[^A-Za-z0-9._-]+", "_", clean(value)).strip("._")
+    return value or fallback
+
+
+def extract_pdf_text(path: Path) -> str:
+    chunks: List[str] = []
+    if pdfplumber is not None:
+        try:
+            with pdfplumber.open(str(path)) as pdf:
+                for page in pdf.pages:
+                    chunks.append(page.extract_text() or "")
+        except Exception:
+            chunks = []
+    if not any(chunks) and PdfReader is not None:
+        try:
+            reader = PdfReader(str(path))
+            chunks = [(page.extract_text() or "") for page in reader.pages]
+        except Exception:
+            pass
+    return "\n".join(chunks)
+
+
+def first_match(patterns: Sequence[str], text: str, flags: int = re.I | re.M) -> str:
+    for pattern in patterns:
+        m = re.search(pattern, text, flags)
+        if m:
+            return clean(m.group(1))
+    return ""
+
+
+def parse_document(path: Path) -> Dict[str, str]:
+    text = extract_pdf_text(path)
+    lines = [clean(x) for x in text.splitlines() if clean(x)]
+    joined = "\n".join(lines)
+
+    piva = first_match([
+        r"Partita\s*IVA\s*[:\-]?\s*(\d{11})",
+        r"P\.?\s*IVA\s*[:\-]?\s*(\d{11})",
+    ], joined)
+    company_cf = first_match([
+        r"Codice\s+fiscale(?:\s+e\s+n\.iscr\.[^\n]*)?\s*[:\-]?\s*(\d{11})",
+        r"C\.?F\.?\s*[:\-]?\s*(\d{11})",
+    ], joined)
+    if not piva:
+        nums = re.findall(r"\b\d{11}\b", joined)
+        piva = nums[0] if nums else ""
+    if not company_cf:
+        company_cf = piva
+
+    denominazione = first_match([
+        r"Denominazione\s*[:\-]?\s*([^\n]+)",
+        r"VISURA\s+ORDINARIA[^\n]*\n([^\n]+)",
+    ], joined)
+    if not denominazione:
+        corp = re.compile(r"\b(?:S\.?R\.?L\.?S?|S\.?P\.?A\.?|S\.?N\.?C\.?|S\.?A\.?S\.?)\b", re.I)
+        candidates = [x for x in lines[:80] if corp.search(x) and len(x) < 100]
+        denominazione = candidates[0] if candidates else ""
+    denominazione = re.sub(r"^(?:denominazione\s*[:\-]?\s*)", "", denominazione, flags=re.I)
+
+    sede = first_match([
+        r"Indirizzo\s+Sede\s+legale\s*([^\n]+(?:\n(?!Domicilio|Numero|Codice|Partita|Forma|Data)[^\n]+)?)",
+        r"Sede\s*:\s*([^\n]+)",
+        r"sede\s+legale\s*[:\-]?\s*([^\n]+)",
+    ], joined)
+    pec = first_match([
+        r"(?:Domicilio\s+digitale/PEC|PEC)\s*[:\-]?\s*([\w.+-]+@[\w.-]+\.[A-Za-z]{2,})",
+    ], joined)
+    emails = re.findall(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", joined)
+    mail = next((e for e in emails if e.lower() != pec.lower()), "")
+
+    ateco = first_match([r"Codice\s+ATECO\s*[:\-]?\s*([0-9.\/]+)"], joined)
+    activity = first_match([
+        r"Attivit[aà]\s+prevalente\s*[:\-]?\s*([^\n]+(?:\n(?!Codice|Attivit|Albi|L'impresa)[^\n]+){0,3})",
+        r"Descrizione\s+ATECO\s*[:\-]?\s*([^\n]+)",
+    ], joined)
+    year = first_match([
+        r"Data\s+atto\s+di\s+costituzione\s*[:\-]?\s*\d{1,2}[/-]\d{1,2}[/-](\d{4})",
+        r"Data\s+costituzione\s*[:\-]?\s*\d{1,2}[/-]\d{1,2}[/-](\d{4})",
+    ], joined)
+
+    admin_name = first_match([
+        r"Amministratore\s+Unico\s*[:\-]?\s*([A-ZÀ-Ü' ]{4,})",
+        r"AMMINISTRATORE\s+UNICO\s*\n?\s*([A-ZÀ-Ü' ]{4,})",
+    ], joined)
+    if admin_name and len(admin_name) > 70:
+        admin_name = admin_name.split(" Rappresentante")[0]
+    admin_cf = first_match([
+        r"(?:codice\s+fiscale|C\.?F\.?)\s*[:\-]?\s*([A-Z]{6}[0-9A-Z]{10})",
+    ], joined)
+    person_cfs = re.findall(r"\b[A-Z]{6}[0-9A-Z]{10}\b", joined, re.I)
+    if not admin_cf and person_cfs:
+        admin_cf = person_cfs[0].upper()
+
+    admin_birth = first_match([r"nat[oa]\s+a\s+([^\n;]+?)\s+il\s+(\d{1,2}[/-]\d{1,2}[/-]\d{4})"], joined)
+    birth_date = ""
+    birth_place = ""
+    m = re.search(r"nat[oa]\s+a\s+([^\n;]+?)\s+il\s+(\d{1,2}[/-]\d{1,2}[/-]\d{4})", joined, re.I)
+    if m:
+        birth_place, birth_date = clean(m.group(1)), clean(m.group(2))
+    residence = first_match([r"residente(?:/domiciliato)?\s+(?:in|a)\s+([^\n;]+)"], joined)
+
+    return {
+        "denominazione": denominazione.upper(),
+        "partita_iva": piva,
+        "codice_fiscale": company_cf,
+        "sede_legale": sede,
+        "sede_operativa": "",
+        "anno_costituzione": year,
+        "settore_attivita": activity,
+        "codice_ateco": ateco,
+        "mail_azienda": mail,
+        "telefono_azienda": "",
+        "pec": pec,
+        "amministratore_nome": admin_name.title(),
+        "amministratore_carica": "Amministratore unico" if admin_name else "",
+        "amministratore_luogo_nascita": birth_place,
+        "amministratore_data_nascita": birth_date,
+        "amministratore_residenza": residence,
+        "amministratore_codice_fiscale": admin_cf,
+        "amministratore_dati_completi": "",
+        "report_path": str(path),
+    }
+
+
+class Database:
+    def __init__(self, path: Path = DB_PATH):
+        self.conn = sqlite3.connect(str(path), check_same_thread=False)
+        self.conn.row_factory = sqlite3.Row
+        self.init_schema()
+
+    def init_schema(self) -> None:
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS clients (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT, updated_at TEXT,
+                denominazione TEXT, partita_iva TEXT, codice_fiscale TEXT, sede_legale TEXT,
+                sede_operativa TEXT, anno_costituzione TEXT, settore_attivita TEXT,
+                codice_ateco TEXT, mail_azienda TEXT, telefono_azienda TEXT, pec TEXT,
+                amministratore_nome TEXT, amministratore_carica TEXT,
+                amministratore_luogo_nascita TEXT, amministratore_data_nascita TEXT,
+                amministratore_residenza TEXT, amministratore_codice_fiscale TEXT,
+                amministratore_dati_completi TEXT, report_path TEXT
+            )
+        """)
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS mandati (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT, client_id INTEGER,
+                data_mandato TEXT, stato TEXT, responsabile TEXT, oggetto TEXT, note TEXT,
+                importo_finanziamento TEXT, percentuale TEXT, importo_consulenza TEXT,
+                banca TEXT, descrizione_compenso TEXT, luogo TEXT, docx_path TEXT, pdf_path TEXT
+            )
+        """)
+        self.conn.commit()
+
+    def clients(self) -> List[sqlite3.Row]:
+        return self.conn.execute("SELECT * FROM clients ORDER BY denominazione COLLATE NOCASE").fetchall()
+
+    def client(self, client_id: int) -> Optional[sqlite3.Row]:
+        return self.conn.execute("SELECT * FROM clients WHERE id=?", (client_id,)).fetchone()
+
+    def save_client(self, data: Dict[str, str], client_id: Optional[int] = None) -> int:
+        values = [clean(data.get(f, "")) for f in CLIENT_FIELDS]
+        if client_id:
+            sets = ",".join(f"{f}=?" for f in CLIENT_FIELDS)
+            self.conn.execute(f"UPDATE clients SET {sets}, updated_at=? WHERE id=?", values + [now_iso(), client_id])
+            self.conn.commit()
+            return client_id
+        fields = ",".join(CLIENT_FIELDS)
+        qs = ",".join("?" for _ in CLIENT_FIELDS)
+        cur = self.conn.execute(
+            f"INSERT INTO clients(created_at,updated_at,{fields}) VALUES(?,?,{qs})",
+            [now_iso(), now_iso()] + values,
+        )
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+    def delete_client(self, client_id: int) -> None:
+        self.conn.execute("DELETE FROM clients WHERE id=?", (client_id,))
+        self.conn.commit()
+
+    def mandates(self) -> List[sqlite3.Row]:
+        return self.conn.execute("""
+            SELECT m.*, c.denominazione AS cliente FROM mandati m
+            LEFT JOIN clients c ON c.id=m.client_id ORDER BY m.id DESC
+        """).fetchall()
+
+    def save_mandate(self, data: Dict[str, str]) -> int:
+        fields = ["client_id", "data_mandato", "stato", "responsabile", "oggetto", "note",
+                  "importo_finanziamento", "percentuale", "importo_consulenza", "banca",
+                  "descrizione_compenso", "luogo", "docx_path", "pdf_path"]
+        vals = [data.get(f, "") for f in fields]
+        qs = ",".join("?" for _ in fields)
+        cur = self.conn.execute(
+            f"INSERT INTO mandati(created_at,{','.join(fields)}) VALUES(?,{qs})",
+            [now_iso()] + vals,
+        )
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+    def update_path(self, mandate_id: int, path: str) -> None:
+        self.conn.execute("UPDATE mandati SET docx_path=? WHERE id=?", (path, mandate_id))
+        self.conn.commit()
+
+
+@st.cache_resource
+def get_db() -> Database:
+    return Database()
+
+
+def iter_paragraphs(document: Document) -> Iterable[Any]:
+    for p in document.paragraphs:
+        yield p
+    for table in document.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for p in cell.paragraphs:
+                    yield p
+
+
+def replace_everywhere(document: Document, replacements: Dict[str, str]) -> None:
+    for paragraph in iter_paragraphs(document):
+        original = paragraph.text
+        updated = original
+        for key, value in replacements.items():
+            updated = updated.replace(key, value)
+        if updated != original:
+            if paragraph.runs:
+                paragraph.runs[0].text = updated
+                for run in paragraph.runs[1:]:
+                    run.text = ""
+            else:
+                paragraph.text = updated
+
+
+def admin_text(c: Dict[str, Any]) -> str:
+    name = clean(c.get("amministratore_nome")) or "INSERIRE DATI AMMINISTRATORE"
+    details = []
+    if c.get("amministratore_luogo_nascita"):
+        details.append(f"nato a {c['amministratore_luogo_nascita']}")
+    if c.get("amministratore_data_nascita"):
+        details.append(f"il {c['amministratore_data_nascita']}")
+    if c.get("amministratore_residenza"):
+        details.append(f"residente/domiciliato in {c['amministratore_residenza']}")
+    if c.get("amministratore_codice_fiscale"):
+        details.append(f"codice fiscale {c['amministratore_codice_fiscale']}")
+    return name + ("; " + "; ".join(details) if details else "")
+
+
+def generate_docx(client: Dict[str, Any], mandate: Dict[str, Any]) -> Path:
+    if not TEMPLATE_PATH.exists():
+        raise FileNotFoundError("Mandato_vuoto.docx non trovato nella cartella GitHub")
+    doc = Document(str(TEMPLATE_PATH))
+    amount = mandate.get("importo_consulenza", "")
+    financing = mandate.get("importo_finanziamento", "")
+    bank = clean(mandate.get("banca", ""))
+    desc = clean(mandate.get("descrizione_compenso", ""))
+    if not desc:
+        desc = f"del finanziamento di € {financing}"
+        if bank:
+            desc += f" erogato da {bank}"
+    replacements = {
+        "INSERIRE DATI AMINISTRATORE": admin_text(client),
+        "INSERIRE DATI AMMINISTRATORE": admin_text(client),
+        "INSERIRE DATI SOCIETA’": clean(client.get("denominazione")),
+        "INSERIRE DATI SOCIETA'": clean(client.get("denominazione")),
+        "INSERIRE PARTITA IVA": clean(client.get("partita_iva") or client.get("codice_fiscale")),
+        "importo": f"€ {amount}",
+        "INSERIRE DESCRIZIONE": desc,
+    }
+    replace_everywhere(doc, replacements)
+    name = safe_filename(client.get("denominazione", "CLIENTE"))
+    dt = clean(mandate.get("data_mandato")) or date.today().strftime("%d-%m-%Y")
+    out = MANDATI_DIR / f"Mandato_{name}_{safe_filename(dt)}.docx"
+    doc.save(str(out))
+    return out
+
+
+def parse_money(value: Any) -> float:
+    """Converte importi italiani/esteri anche con simbolo euro e testo accessorio."""
+    raw = str(value or "").strip()
+    if not raw:
+        return 0.0
+    raw = raw.replace("€", "").replace("EUR", "").replace("eur", "")
+    raw = re.sub(r"[^0-9,.-]", "", raw)
+    if not raw or raw in {"-", ".", ","}:
+        return 0.0
+    if "," in raw and "." in raw:
+        # Formato italiano: 25.000,00; formato internazionale: 25,000.00
+        if raw.rfind(",") > raw.rfind("."):
+            raw = raw.replace(".", "").replace(",", ".")
+        else:
+            raw = raw.replace(",", "")
+    elif "," in raw:
+        raw = raw.replace(".", "").replace(",", ".")
+    elif raw.count(".") > 1:
+        raw = raw.replace(".", "")
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def money(value: float) -> str:
+    return f"{value:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+st.set_page_config(page_title=APP_NAME, page_icon="📊", layout="wide")
+st.markdown("""
+<style>
+.stApp {background: linear-gradient(180deg,#07111f 0%,#0e1a2b 100%); color:#eef3f8;}
+[data-testid="stSidebar"] {background:#07111f;}
+.fp-card {background:#142238;border:1px solid #33465f;border-radius:16px;padding:18px;margin-bottom:12px;}
+h1,h2,h3 {color:#dce6f0 !important;}
+</style>
+""", unsafe_allow_html=True)
+
+if LOGO_PATH.exists():
+    st.sidebar.image(str(LOGO_PATH), use_container_width=True)
+st.sidebar.title("FinancePlus.Tech")
+page = st.sidebar.radio("Menu", ["Dashboard", "Inserisci cliente", "Elenco clienti", "Nuovo mandato", "Elenco mandati"])
+db = get_db()
+
+if page == "Dashboard":
+    st.title("FinancePlus Mandato")
+    clients = db.clients()
+    mandates = db.mandates()
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Clienti", len(clients))
+    c2.metric("Mandati", len(mandates))
+    total = sum(parse_money(m["importo_consulenza"]) for m in mandates)
+    c3.metric("Compensi registrati", f"€ {money(total)}")
+    st.info("Applicazione Streamlit: compatibile con Streamlit Community Cloud. Nessuna dipendenza da Tkinter.")
+
+elif page == "Inserisci cliente":
+    st.title("Inserisci cliente")
+    upload = st.file_uploader("Carica visura o report PDF", type=["pdf"])
+    extracted: Dict[str, str] = {}
+    if upload is not None:
+        dest = UPLOAD_DIR / safe_filename(upload.name)
+        dest.write_bytes(upload.getvalue())
+        with st.spinner("Lettura automatica del documento..."):
+            extracted = parse_document(dest)
+        st.success("Documento letto. Verifica i dati e salva.")
+
+    with st.form("client_form"):
+        c1, c2 = st.columns(2)
+        data: Dict[str, str] = {}
+        with c1:
+            data["denominazione"] = st.text_input("Denominazione", extracted.get("denominazione", ""))
+            data["partita_iva"] = st.text_input("Partita IVA", extracted.get("partita_iva", ""))
+            data["codice_fiscale"] = st.text_input("Codice fiscale", extracted.get("codice_fiscale", ""))
+            data["sede_legale"] = st.text_input("Sede legale", extracted.get("sede_legale", ""))
+            data["sede_operativa"] = st.text_input("Sede operativa", extracted.get("sede_operativa", ""))
+            data["anno_costituzione"] = st.text_input("Anno costituzione", extracted.get("anno_costituzione", ""))
+            data["settore_attivita"] = st.text_area("Settore / attività", extracted.get("settore_attivita", ""))
+            data["codice_ateco"] = st.text_input("Codice ATECO", extracted.get("codice_ateco", ""))
+            data["mail_azienda"] = st.text_input("E-mail", extracted.get("mail_azienda", ""))
+            data["telefono_azienda"] = st.text_input("Telefono", extracted.get("telefono_azienda", ""))
+            data["pec"] = st.text_input("PEC", extracted.get("pec", ""))
+        with c2:
+            data["amministratore_nome"] = st.text_input("Amministratore", extracted.get("amministratore_nome", ""))
+            data["amministratore_carica"] = st.text_input("Carica", extracted.get("amministratore_carica", "Amministratore unico"))
+            data["amministratore_luogo_nascita"] = st.text_input("Luogo di nascita", extracted.get("amministratore_luogo_nascita", ""))
+            data["amministratore_data_nascita"] = st.text_input("Data di nascita", extracted.get("amministratore_data_nascita", ""))
+            data["amministratore_residenza"] = st.text_area("Residenza / domicilio", extracted.get("amministratore_residenza", ""))
+            data["amministratore_codice_fiscale"] = st.text_input("C.F. amministratore", extracted.get("amministratore_codice_fiscale", ""))
+            data["amministratore_dati_completi"] = st.text_area("Dati completi amministratore", extracted.get("amministratore_dati_completi", ""))
+            data["report_path"] = extracted.get("report_path", "")
+        submitted = st.form_submit_button("Salva cliente", use_container_width=True)
+    if submitted:
+        if not clean(data["denominazione"]):
+            data["denominazione"] = f"CLIENTE_{datetime.now():%Y%m%d_%H%M%S}"
+        cid = db.save_client(data)
+        st.success(f"Cliente salvato correttamente. ID {cid}")
+
+elif page == "Elenco clienti":
+    st.title("Elenco clienti")
+    rows = db.clients()
+    if not rows:
+        st.warning("Nessun cliente presente.")
+    for row in rows:
+        with st.expander(f"{row['denominazione'] or 'Cliente senza denominazione'} — P.IVA {row['partita_iva'] or '-'}"):
+            st.write(f"**Sede:** {row['sede_legale'] or '-'}")
+            st.write(f"**PEC:** {row['pec'] or '-'}")
+            st.write(f"**Amministratore:** {row['amministratore_nome'] or '-'}")
+            if st.button("Elimina cliente", key=f"del_{row['id']}"):
+                db.delete_client(int(row["id"]))
+                st.rerun()
+
+elif page == "Nuovo mandato":
+    st.title("Nuovo mandato")
+    clients = db.clients()
+    if not clients:
+        st.warning("Inserisci prima almeno un cliente.")
+    else:
+        options = {f"{r['denominazione']} — {r['partita_iva'] or r['codice_fiscale'] or 'senza P.IVA'}": int(r['id']) for r in clients}
+        selected = st.selectbox("Cliente", list(options))
+        client_row = db.client(options[selected])
+        client = dict(client_row) if client_row else {}
+        with st.form("mandate_form"):
+            c1, c2 = st.columns(2)
+            with c1:
+                data_mandato = st.date_input("Data mandato", date.today()).strftime("%d-%m-%Y")
+                stato = st.selectbox("Stato", ["Bozza", "Definitivo", "Firmato"])
+                responsabile = st.text_input("Responsabile pratica", "Dott. Danilo D'Angelo")
+                oggetto = st.text_input("Oggetto", "Consulenza finanziaria")
+                banca = st.text_input("Banca / intermediario")
+                luogo = st.text_input("Luogo", "Casagiove")
+            with c2:
+                importo_fin = st.number_input("Importo finanziamento (€)", min_value=0.0, step=10000.0)
+                percentuale = st.number_input("Compenso (%)", min_value=0.0, step=0.25, value=5.0)
+                importo_cons = importo_fin * percentuale / 100
+                st.metric("Compenso calcolato", f"€ {money(importo_cons)}")
+                descrizione = st.text_area("Descrizione compenso", f"in riferimento alla richiesta ed approvazione del finanziamento di € {money(importo_fin)}" + (f" erogato da {banca}" if banca else ""))
+                note = st.text_area("Note")
+            create = st.form_submit_button("Genera mandato Word", use_container_width=True)
+        if create:
+            mandate = {
+                "client_id": options[selected], "data_mandato": data_mandato, "stato": stato,
+                "responsabile": responsabile, "oggetto": oggetto, "note": note,
+                "importo_finanziamento": money(importo_fin), "percentuale": str(percentuale),
+                "importo_consulenza": money(importo_cons), "banca": banca,
+                "descrizione_compenso": descrizione, "luogo": luogo, "docx_path": "", "pdf_path": "",
+            }
+            mid = db.save_mandate(mandate)
+            try:
+                out = generate_docx(client, mandate)
+                db.update_path(mid, str(out))
+                st.success("Mandato generato correttamente.")
+                st.download_button("Scarica mandato DOCX", out.read_bytes(), file_name=out.name, mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+            except Exception as exc:
+                st.error(f"Errore nella generazione: {exc}")
+
+elif page == "Elenco mandati":
+    st.title("Elenco mandati")
+    rows = db.mandates()
+    if not rows:
+        st.warning("Nessun mandato presente.")
+    for row in rows:
+        st.markdown(f"### {row['cliente'] or 'Cliente'} — {row['data_mandato'] or '-'}")
+        st.write(f"Stato: **{row['stato'] or '-'}** | Finanziamento: **€ {money(parse_money(row['importo_finanziamento']))}** | Compenso: **€ {money(parse_money(row['importo_consulenza']))}**")
+        path = Path(row["docx_path"] or "")
+        if path.exists():
+            st.download_button("Scarica DOCX", path.read_bytes(), file_name=path.name, key=f"dl_{row['id']}")
+        st.divider()
