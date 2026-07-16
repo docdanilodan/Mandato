@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*.log
+.venv/
+venv/
+.env
+.DS_Store
+FinancePlus_Data/temp/
+FinancePlus_Data/mandati/
+FinancePlus_Data/visure/
+FinancePlus_Data/report/
+~$*.docx
